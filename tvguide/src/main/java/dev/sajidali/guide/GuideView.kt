@@ -17,6 +17,10 @@ import androidx.core.content.withStyledAttributes
 import dev.sajidali.guide.data.Channel
 import dev.sajidali.guide.data.DataProvider
 import dev.sajidali.guide.data.Event
+import dev.sajidali.guide.render.ChannelRenderer
+import dev.sajidali.guide.render.EventRenderer
+import dev.sajidali.guide.render.TimeLineRenderer
+import dev.sajidali.guide.render.TimebarRenderer
 import org.joda.time.LocalDateTime
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
@@ -52,9 +56,10 @@ class GuideView : ViewGroup {
     private var timeFormat: String = "HH:mm"
 
     private val mClipRect: Rect
-    private val mDrawingRect: Rect
+    private var mDrawingRect: Rect // Will be less used if pooling is per-item
     private val mMeasuringRect: Rect
     private val mPaint: Paint
+    private lateinit var rectPool: RectPool
     private val mScroller: Scroller
     private val mGestureDetector: GestureDetector
 
@@ -75,10 +80,16 @@ class GuideView : ViewGroup {
 
     private var mTimebarBackground: Drawable?
 
-    private var mHoursInViewPort: Long
+    private var mHoursInViewPort: Long // Used by TimebarRenderer
     private var mDaysBack: Long
     private var mDaysForward: Long
-    private var mTimeSpacing: Long
+    private var mTimeSpacing: Long // Used by TimebarRenderer
+
+    // Renderers
+    private lateinit var timebarRenderer: TimebarRenderer
+    private lateinit var timeLineRenderer: TimeLineRenderer
+    private lateinit var eventRenderer: EventRenderer
+    private lateinit var channelRenderer: ChannelRenderer
 
     private var screenWidth = 0
     private var screenHeight = 0
@@ -165,11 +176,12 @@ class GuideView : ViewGroup {
     init {
         setWillNotDraw(false)
 
-        mDrawingRect = Rect()
+        mDrawingRect = Rect() // Still useful for overall canvas bounds
         mClipRect = Rect()
         mMeasuringRect = Rect()
         mPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         mPaint.strokeWidth = 0.5f
+        rectPool = RectPool()
         mGestureDetector = GestureDetector(context, OnGestureListener())
 
         // Adding some friction that makes the epg less flappy.
@@ -199,10 +211,70 @@ class GuideView : ViewGroup {
         mDaysForward = TimeUnit.DAYS.toMillis(1)
         mTimeSpacing = TimeUnit.MINUTES.toMillis(30)
         screenDimenInitialization()
-
+        initializeRenderers()
     }
 
-    private fun channelHeight(isSelected: Boolean): Int {
+    private fun initializeRenderers() {
+        val defaultTextColor = eventLayoutTextColor?.defaultColor ?: Color.WHITE
+        // Ensure eventLayoutTextColor is not null before accessing getColorForState
+        val focusedTextColor = eventLayoutTextColor?.getColorForState(intArrayOf(android.R.attr.state_focused), defaultTextColor) ?: defaultTextColor
+        val selectedTextColor = eventLayoutTextColor?.getColorForState(intArrayOf(android.R.attr.state_selected), defaultTextColor) ?: defaultTextColor
+
+        timebarRenderer = TimebarRenderer(
+            rectPool = rectPool,
+            mPaint = mPaint,
+            mTimebarBackground = mTimebarBackground,
+            mClipRect = mClipRect, // TimebarRenderer uses mClipRect for its internal clipping logic
+            mChannelLayoutWidth = mChannelLayoutWidth,
+            mChannelLayoutMargin = mChannelLayoutMargin,
+            mTimeBarHeight = mTimeBarHeight,
+            mTimeBarTextSize = mTimeBarTextSize,
+            eventLayoutTextColorDefault = defaultTextColor,
+            getXFromTime = { time -> getXFrom(time) }
+        )
+
+        timeLineRenderer = TimeLineRenderer(
+            rectPool = rectPool,
+            mPaint = mPaint,
+            mTimeBarLineWidth = mTimeBarLineWidth,
+            mTimeBarLineColor = mTimeBarLineColor,
+            getXFromTime = { time -> getXFrom(time) },
+            shouldDrawTimeLineFn = { now -> shouldDrawTimeLine(now) }
+        )
+
+        eventRenderer = EventRenderer(
+            rectPool = rectPool,
+            mPaint = mPaint,
+            mMeasuringRect = mMeasuringRect,
+            mClipRect = mClipRect, // EventRenderer uses mClipRect for its internal clipping logic
+            dataProvider = dataProvider,
+            mEventBackground = mEventBackground,
+            eventLayoutTextColorFocused = focusedTextColor,
+            eventLayoutTextColorSelected = selectedTextColor,
+            eventLayoutTextColorDefault = defaultTextColor,
+            mChannelLayoutPadding = mChannelLayoutPadding,
+            mChannelLayoutMargin = mChannelLayoutMargin,
+            getXFromTime = { time -> getXFrom(time) },
+            getTopFromChannelPos = { pos -> getTopFrom(pos) },
+            getChannelHeight = { selected -> channelHeight(selected) }
+        )
+
+        channelRenderer = ChannelRenderer(
+            rectPool = rectPool,
+            mPaint = mPaint,
+            mMeasuringRect = mMeasuringRect,
+            dataProvider = dataProvider,
+            mChannelRowBackground = mChannelRowBackground,
+            eventLayoutTextColorFocused = focusedTextColor,
+            eventLayoutTextColorDefault = defaultTextColor,
+            mChannelLayoutWidth = mChannelLayoutWidth,
+            programAreaWidthValue = programAreaWidth,
+            getTopFromChannelPos = { pos -> getTopFrom(pos) },
+            getChannelHeight = { selected -> channelHeight(selected) }
+        )
+    }
+
+    internal fun channelHeight(isSelected: Boolean): Int {
         return if (isSelected) (mChannelLayoutHeight * mSelectedRowScale).toInt() else mChannelLayoutHeight
     }
 
@@ -271,12 +343,13 @@ class GuideView : ViewGroup {
                 ).toLong()
             )
         }
-
         screenDimenInitialization()
+        initializeRenderers() // Re-initialize renderers if attributes change that affect them
     }
 
     fun setDataProvider(provider: DataProvider) {
         this.dataProvider = provider
+        initializeRenderers() // Update renderers that depend on dataProvider
         dataProvider?.onDataUpdated {
             recalculateAndRedraw(this.selectedEventPos, false)
         }
@@ -303,17 +376,56 @@ class GuideView : ViewGroup {
             mTimeLowerBoundary = getTimeFrom(scrollX)
             mTimeUpperBoundary = getTimeFrom(scrollX + width)
 
-            val drawingRect = mDrawingRect
+            val drawingRect = mDrawingRect // Retained for potential future use or other logic not related to renderers.
             drawingRect.left = scrollX
             drawingRect.top = scrollY
             drawingRect.right = drawingRect.left + width
             drawingRect.bottom = drawingRect.top + height
 
-            drawChannelListItems(canvas, drawingRect)
-            drawEvents(canvas, drawingRect)
-            drawTimebar(canvas, drawingRect)
-            drawTimeLine(canvas, drawingRect)
-            //drawResetButton(canvas, drawingRect);
+            // Order matters for drawing: Channels background, Events, then Timebar/Timeline overlays.
+            channelRenderer.draw(
+                canvas = canvas,
+                scrollX = scrollX,
+                firstVisibleChannelPos = firstVisibleChannelPosition,
+                lastVisibleChannelPos = lastVisibleChannelPosition,
+                currentSelectedChannelPos = selectedChannelPos,
+                eventTextSize = eventLayoutTextSize.toFloat(),
+                selectedRowScale = mSelectedRowScale
+            )
+
+            eventRenderer.draw(
+                canvas = canvas,
+                currentScrollX = scrollX,
+                scrollY = scrollY,
+                currentViewWidth = width,
+                firstVisibleChannelPos = firstVisibleChannelPosition,
+                lastVisibleChannelPos = lastVisibleChannelPosition,
+                currentSelectedChannelPos = selectedChannelPos,
+                currentSelectedEventPos = selectedEventPos,
+                currentTimeLowerBoundary = mTimeLowerBoundary,
+                currentTimeUpperBoundary = mTimeUpperBoundary,
+                currentChannelAreaWidth = channelAreaWidth, // Pass channelAreaWidth
+                eventTextSize = eventLayoutTextSize.toFloat(), // Pass base event text size
+                selectedRowScale = mSelectedRowScale // Pass selected row scale
+            )
+
+            timebarRenderer.draw(
+                canvas = canvas,
+                scrollX = scrollX,
+                scrollY = scrollY,
+                width = width, // view width
+                timeLowerBoundary = mTimeLowerBoundary,
+                timeFormat = timeFormat,
+                hoursInViewPort = mHoursInViewPort,
+                timeSpacing = mTimeSpacing
+            )
+
+            timeLineRenderer.draw(
+                canvas = canvas,
+                scrollY = scrollY,
+                viewHeight = height // view height
+            )
+            //drawResetButton(canvas);
 
             // If scroller is scrolling/animating do scroll. This applies when doing a fling.
             if (mScroller.computeScrollOffset()) {
@@ -340,317 +452,40 @@ class GuideView : ViewGroup {
 
     override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {}
 
-    private fun drawTimebar(canvas: Canvas, drawingRect: Rect) {
-        drawingRect.left = scrollX
-        drawingRect.top = scrollY
-        drawingRect.right = drawingRect.left + width
-        drawingRect.bottom = drawingRect.top + mTimeBarHeight
-
-        mTimebarBackground?.let {
-            it.bounds = drawingRect
-            it.draw(canvas)
-        }
-
-
-        drawingRect.left = scrollX + mChannelLayoutWidth + mChannelLayoutMargin
-        drawingRect.top = scrollY
-        drawingRect.right = drawingRect.left + width
-        drawingRect.bottom = drawingRect.top + mTimeBarHeight
-
-        mClipRect.left = scrollX + mChannelLayoutWidth + mChannelLayoutMargin
-        mClipRect.top = scrollY
-        mClipRect.right = scrollX + width
-        mClipRect.bottom = mClipRect.top + mTimeBarHeight
-
-        canvas.save()
-        canvas.clipRect(mClipRect)
-
-//        // Background
-//        drawStrokedRectangle(canvas, drawingRect)
-
-        // Time stamps
-        mPaint.color = eventLayoutTextColor?.defaultColor ?: Color.WHITE
-        mPaint.textSize = mTimeBarTextSize.toFloat()
-
-        for (i in 0 until mHoursInViewPort / mTimeSpacing) {
-            // Get time and round to nearest half hour
-            val time =
-                mTimeSpacing * ((mTimeLowerBoundary + mTimeSpacing * i + mTimeSpacing / 2) / mTimeSpacing)
-
-            canvas.drawText(
-                time.formatToPattern(timeFormat),
-                getXFrom(time).toFloat(),
-                (drawingRect.top + ((drawingRect.bottom - drawingRect.top) / 2 + mTimeBarTextSize / 2)).toFloat(),
-                mPaint
-            )
-        }
-
-        canvas.restore()
-
-        drawTimebarDayIndicator(canvas, drawingRect)
-//        drawTimebarBottomStroke(canvas, drawingRect)
-    }
+    /* All original drawing methods (drawTimebar, drawTimebarDayIndicator, drawTimeLine,
+       drawEvents, drawEvent, drawChannelListItems, drawChannelItem) are removed.
+       Their logic is now in their respective Renderer classes.
+    */
 
     fun setTimeFormat(format: String) {
         this.timeFormat = format
+        // Potentially re-init or update TimebarRenderer if it caches time format string.
+        // For now, TimebarRenderer.draw takes timeFormat directly.
         redraw()
     }
 
-    private fun drawTimebarDayIndicator(canvas: Canvas, drawingRect: Rect) {
-        drawingRect.left = scrollX
-        drawingRect.top = scrollY
-        drawingRect.right = drawingRect.left + mChannelLayoutWidth
-        drawingRect.bottom = drawingRect.top + mTimeBarHeight
-//
-        mPaint.style = Paint.Style.FILL
-//        mPaint.color = mEpgTimebarBackColor
-//        canvas.drawRect(drawingRect, mPaint)
+    // Helper methods like isEventCurrent, setEventDrawingRectangle are now part of EventRenderer or handled by it.
+    // isEventVisible is still here as it's used by drawEvents (which is also currently still here but will be removed).
+    // Once drawEvents is removed, isEventVisible can be removed if EventRenderer has its own.
 
-        // Background
-//        drawStrokedRectangle(canvas, drawingRect)
+    // This version of drawEvents is kept temporarily until EventRenderer is fully integrated
+    // and confirmed to handle its logic (like mClipRect).
+    // The old drawEvents method is now fully removed. EventRenderer handles this logic.
 
-        // Text
-        mPaint.color = eventLayoutTextColor?.defaultColor ?: Color.WHITE
-        mPaint.textSize = mTimeBarTextSize.toFloat()
-        mPaint.textAlign = Paint.Align.CENTER
-        canvas.drawText(
-            mTimeLowerBoundary.toDayName(),
-            (drawingRect.left + (drawingRect.right - drawingRect.left) / 2).toFloat(),
-            (drawingRect.top + ((drawingRect.bottom - drawingRect.top) / 2 + mTimeBarTextSize / 2)).toFloat(),
-            mPaint
-        )
-
-        mPaint.textAlign = Paint.Align.LEFT
-    }
-
-    private fun drawTimeLine(canvas: Canvas, drawingRect: Rect) {
-        val now = System.currentTimeMillis()
-
-        if (shouldDrawTimeLine(now)) {
-            drawingRect.left = getXFrom(now)
-            drawingRect.top = scrollY
-            drawingRect.right = drawingRect.left + mTimeBarLineWidth
-            drawingRect.bottom = drawingRect.top + height
-
-            mPaint.color = mTimeBarLineColor
-            canvas.drawRect(drawingRect, mPaint)
-        }
-
-    }
-
-    private fun drawEvents(canvas: Canvas, drawingRect: Rect) {
-        val firstPos = firstVisibleChannelPosition
-        val lastPos = lastVisibleChannelPosition
-
-        for (channelPos in firstPos..lastPos) {
-            // Set clip rectangle
-            mClipRect.left = scrollX + mChannelLayoutWidth + mChannelLayoutMargin
-            mClipRect.top = getTopFrom(channelPos)
-            mClipRect.right = scrollX + width
-            mClipRect.bottom = mClipRect.top + channelHeight(selectedChannelPos == channelPos)
-
-            canvas.save()
-            canvas.clipRect(mClipRect)
-
-            // Draw each event
-            var foundFirst = false
-
-            val epgEvents = dataProvider?.eventsOfChannel(channelPos)
-            epgEvents?.takeIf { it.isNotEmpty() }?.let { events ->
-                for ((index, event) in events.withIndex()) {
-                    if (isEventVisible(event.start, event.end)) {
-                        drawEvent(canvas, channelPos, index, drawingRect)
-                        foundFirst = true
-                    } else if (foundFirst) {
-                        break
-                    }
-                }
-            }
-            canvas.restore()
-        }
-
-    }
-
-    private fun drawEvent(
-        canvas: Canvas, channelPosition: Int, eventPosition: Int, drawingRect: Rect
-    ) {
-        val event = dataProvider?.eventOfChannelAt(channelPosition, eventPosition) ?: return
-        setEventDrawingRectangle(
-            channelPosition, event.start, event.end, drawingRect
-        )
-        if (drawingRect.left < scrollX + channelAreaWidth) {
-            drawingRect.left = scrollX + channelAreaWidth
-        }
-
-        // Background
-        if (channelPosition == selectedChannelPos && selectedEventPos != -1 && eventPosition == selectedEventPos) {
-            mEventBackground?.let {
-                it.state = intArrayOf(android.R.attr.state_focused)
-                it.bounds = drawingRect
-                it.draw(canvas)
-            }
-        } else if (event.isCurrent) {
-            mEventBackground?.let {
-                it.state = intArrayOf(android.R.attr.state_selected)
-                it.bounds = drawingRect
-                it.draw(canvas)
-            }
-        } else {
-            mEventBackground?.let {
-                it.state = intArrayOf()
-                it.bounds = drawingRect
-                it.draw(canvas)
-            }
-        }
-
-//        mPaint.style = Paint.Style.STROKE
-//        mPaint.strokeWidth = 0.3f
-        mPaint.color = Color.LTGRAY
-//        canvas.drawRect(drawingRect, mPaint)
-        mPaint.style = Paint.Style.FILL
-
-        // Add left and right inner padding
-        drawingRect.left += mChannelLayoutPadding + 16
-        drawingRect.right -= mChannelLayoutPadding
-
-        // Text
-        mPaint.color =
-            if (channelPosition == selectedChannelPos && selectedEventPos != -1 && eventPosition == selectedEventPos) {
-                eventLayoutTextColor?.getColorForState(
-                    intArrayOf(android.R.attr.state_focused), eventLayoutTextColor!!.defaultColor
-                ) ?: Color.WHITE
-            } else if (event.isCurrent) {
-                eventLayoutTextColor?.getColorForState(
-                    intArrayOf(android.R.attr.state_selected), eventLayoutTextColor!!.defaultColor
-                ) ?: Color.WHITE
-            } else {
-                eventLayoutTextColor?.defaultColor ?: Color.WHITE
-            }
-        mPaint.textSize =
-            eventLayoutTextSize * if (channelPosition == selectedChannelPos) mSelectedRowScale else 1f
-
-        // Move drawing.top so text will be centered (text is drawn bottom>up)
-        mPaint.getTextBounds(event.title, 0, event.title.length, mMeasuringRect)
-        drawingRect.top += (drawingRect.bottom - drawingRect.top) / 2 + mMeasuringRect.height() / 2
-
-        var title = event.title
-        title = title.substring(
-            0, mPaint.breakText(title, true, (drawingRect.right - drawingRect.left).toFloat(), null)
-        )
-        canvas.drawText(title, drawingRect.left.toFloat(), drawingRect.top.toFloat(), mPaint)
-
-    }
-
-    private fun isEventCurrent(event: Event?): Boolean {
-        event ?: return false
-        val now = System.currentTimeMillis()
-        return event.start <= now && event.end >= now
-    }
-
-    private fun isEventCurrent(eventPosition: Int): Boolean {
-        val event = selectedEvent ?: return false
-        return isEventCurrent(event)
-    }
-
-    private fun setEventDrawingRectangle(
-        channelPosition: Int, start: Long, end: Long, drawingRect: Rect
-    ) {
-        drawingRect.left = getXFrom(start)
-        drawingRect.top = getTopFrom(channelPosition)
-        drawingRect.right = getXFrom(end) - mChannelLayoutMargin
-        drawingRect.bottom = drawingRect.top + channelHeight(selectedChannelPos == channelPosition)
-    }
-
-    private fun drawChannelListItems(canvas: Canvas, drawingRect: Rect) {
-        // Background
-        mMeasuringRect.left = scrollX
-        mMeasuringRect.top = scrollY
-        mMeasuringRect.right = drawingRect.left + mChannelLayoutWidth
-        mMeasuringRect.bottom = mMeasuringRect.top + height
-
-//        mPaint.color = Color.LTGRAY
-//        mPaint.strokeWidth = 1f
-//        mPaint.style = Paint.Style.STROKE
-//        canvas.drawRect(mMeasuringRect, mPaint)
-//        mPaint.style = Paint.Style.FILL
-
-        val firstPos = firstVisibleChannelPosition
-        val lastPos = lastVisibleChannelPosition
-
-        for (pos in firstPos..lastPos) {
-            drawChannelItem(canvas, pos, drawingRect)
-        }
-    }
-
-    private fun drawChannelItem(canvas: Canvas, position: Int, drawingRect: Rect) {
-
-        //Draw Full Row Background
-        drawingRect.left = scrollX
-        drawingRect.top = getTopFrom(position)
-        drawingRect.right = drawingRect.left + programAreaWidth + mChannelLayoutWidth
-        drawingRect.bottom = drawingRect.top + channelHeight(selectedChannelPos == position)
-
-        if (selectedChannelPos == position) {
-            mChannelRowBackground?.let {
-                it.state = intArrayOf(android.R.attr.state_focused)
-                it.bounds = drawingRect
-                it.draw(canvas)
-            }
-        } else {
-            mChannelRowBackground?.let {
-                it.state = intArrayOf()
-                it.bounds = drawingRect
-                it.draw(canvas)
-            }
-        }
-
-        drawingRect.left = scrollX
-        drawingRect.right = drawingRect.left + mChannelLayoutWidth
-
-        drawingRect.left += 16
-
-        //Draw Channel Name
-        mPaint.color = if (selectedChannelPos == position) {
-            eventLayoutTextColor?.getColorForState(
-                intArrayOf(android.R.attr.state_focused), eventLayoutTextColor!!.defaultColor
-            ) ?: Color.WHITE
-        } else {
-            eventLayoutTextColor?.defaultColor ?: Color.WHITE
-        }
-        mPaint.textSize =
-            eventLayoutTextSize * if (position == selectedChannelPos) mSelectedRowScale else 1f
-
-        var title = dataProvider?.channelAt(position)?.title ?: ""
-
-        // Move drawing.top so text will be centered (text is drawn bottom>up)
-        mPaint.getTextBounds(title, 0, title.length, mMeasuringRect)
-        drawingRect.top += (drawingRect.bottom - drawingRect.top) / 2 + mMeasuringRect.height() / 2
-
-        title = title.substring(
-            0, mPaint.breakText(title, true, (drawingRect.right - drawingRect.left).toFloat(), null)
-        )
-        canvas.drawText(title ?: "", drawingRect.left.toFloat(), drawingRect.top.toFloat(), mPaint)
-    }
-
-    private fun drawStrokedRectangle(canvas: Canvas, drawingRect: Rect) {
-        mPaint.strokeWidth = 0.3f
-        mPaint.color = Color.WHITE
-        mPaint.style = Paint.Style.STROKE
-        canvas.drawRect(drawingRect, mPaint)
-        mPaint.style = Paint.Style.FILL
-    }
-
-    private fun shouldDrawTimeLine(now: Long): Boolean {
-        return now in mTimeLowerBoundary until mTimeUpperBoundary
-    }
+    // Keep helper methods in GuideView that are needed by multiple renderers (passed as lambdas)
+    // or for GuideView's own logic.
+    // isEventVisible is no longer needed here as EventRenderer handles its own visibility logic.
 
     fun isTimelineVisible(): Boolean {
+        // This can use the TimeLineRenderer's logic or be kept if GuideView needs it elsewhere.
+        // For now, TimeLineRenderer handles its own shouldDrawTimeLineFn.
         return System.currentTimeMillis() in mTimeLowerBoundary until mTimeUpperBoundary
     }
 
-    private fun isEventVisible(start: Long, end: Long): Boolean {
-        return (start in mTimeLowerBoundary..mTimeUpperBoundary || end in mTimeLowerBoundary..mTimeUpperBoundary || start <= mTimeLowerBoundary && end >= mTimeUpperBoundary)
-    }
+    // This can be removed if EventRenderer's internal isEventVisible is sufficient.
+    // private fun isEventVisible(start: Long, end: Long): Boolean {
+    // return (start in mTimeLowerBoundary..mTimeUpperBoundary || end in mTimeLowerBoundary..mTimeUpperBoundary || start <= mTimeLowerBoundary && end >= mTimeUpperBoundary)
+    // }
 
     private fun calculatedBaseLine(): Long {
         return LocalDateTime.now().toDateTime().minusMillis(mDaysBack.toInt()).millis
